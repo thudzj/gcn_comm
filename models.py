@@ -1,177 +1,71 @@
-from layers import *
-from metrics import *
-
-flags = tf.app.flags
-FLAGS = flags.FLAGS
-
-
-class Model(object):
-    def __init__(self, **kwargs):
-        allowed_kwargs = {'name', 'logging'}
-        for kwarg in kwargs.keys():
-            assert kwarg in allowed_kwargs, 'Invalid keyword argument: ' + kwarg
-        name = kwargs.get('name')
-        if not name:
-            name = self.__class__.__name__.lower()
-        self.name = name
-
-        logging = kwargs.get('logging', False)
-        self.logging = logging
-
-        self.vars = {}
-        self.placeholders = {}
-
-        self.layers = []
-        self.activations = []
-
-        self.inputs = None
-        self.outputs = None
-
-        self.loss = 0
-        self.accuracy = 0
-        self.optimizer = None
-        self.opt_op = None
-
-    def _build(self):
-        raise NotImplementedError
-
-    def build(self):
-        """ Wrapper for _build() """
-        with tf.variable_scope(self.name):
-            self._build()
-
-        # Build sequential layer model
-        self.activations.append(self.inputs)
-        for layer in self.layers:
-            hidden = layer(self.activations[-1])
-            self.activations.append(hidden)
-        self.outputs = self.activations[-1]
-
-        # Store model variables for easy access
-        variables = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=self.name)
-        self.vars = {var.name: var for var in variables}
-
-        # Build metrics
-        self._loss()
-        self._accuracy()
-
-        self.opt_op = self.optimizer.minimize(self.loss)
-
-    def predict(self):
-        pass
-
-    def _loss(self):
-        raise NotImplementedError
-
-    def _accuracy(self):
-        raise NotImplementedError
-
-    def save(self, sess=None):
-        if not sess:
-            raise AttributeError("TensorFlow session not provided.")
-        saver = tf.train.Saver(self.vars)
-        save_path = saver.save(sess, "tmp/%s.ckpt" % self.name)
-        print("Model saved in file: %s" % save_path)
-
-    def load(self, sess=None):
-        if not sess:
-            raise AttributeError("TensorFlow session not provided.")
-        saver = tf.train.Saver(self.vars)
-        save_path = "tmp/%s.ckpt" % self.name
-        saver.restore(sess, save_path)
-        print("Model restored from file: %s" % save_path)
+import torch.nn as nn
+import torch.nn.functional as F
+from layers import GraphConvolution, GraphConvolution_P1, GraphConvolution_P2
+import torch
+from torch.autograd.variable import Variable
+import numpy as np
+from utils import normalize_adj, log_sum_exp
 
 
-class MLP(Model):
-    def __init__(self, placeholders, input_dim, **kwargs):
-        super(MLP, self).__init__(**kwargs)
 
-        self.inputs = placeholders['features']
-        self.input_dim = input_dim
-        # self.input_dim = self.inputs.get_shape().as_list()[1]  # To be supported in future Tensorflow versions
-        self.output_dim = placeholders['labels'].get_shape().as_list()[1]
-        self.placeholders = placeholders
+class GCN(nn.Module):
+    def __init__(self, dims, dropout, use_cuda):
+        super(GCN, self).__init__()
+        self.gc1 = []
+        self.gc2 = []
+        for dim_in, dim_out in zip(dims[:-1], dims[1:]):
+            self.gc1.append(GraphConvolution_P1(dim_in, dim_out, use_cuda))
+            self.gc2.append(GraphConvolution_P2())
+        self.dropout = dropout
+        self.use_cuda = use_cuda
 
-        self.optimizer = tf.train.AdamOptimizer(learning_rate=FLAGS.learning_rate)
+    def get_embedding(self, x, adj):
+        o = self.gc2[0](self.gc1[0](F.dropout(x, self.dropout, training=self.training)), adj)
+        return o
 
-        self.build()
+    def forward(self, x, adj, PI, MUs, PREs):
+        # assignments = F.softmax(var_assignments)
+        # assignments_t = assignments.t()/assignments.t().sum(1, keepdim=True)#F.softmax(var_assignments.t())
+        # x_comms = torch.mm(assignments_t, x)
+        #
+        # x_comms = self.gc1[0](F.dropout(x_comms, self.dropout, training=self.training))
+        x = self.gc2[0](self.gc1[0](F.dropout(x, self.dropout, training=self.training)), adj)
+        if not PI is None:
+            probs = -torch.max(-0.5 * torch.sum((x.unsqueeze(1) - MUs.unsqueeze(0))**2 * PREs.unsqueeze(0), 2) + torch.log(PI) + 0.5*torch.log(PREs).sum(1)-8.0*np.log(2*np.pi))[0].mean()
+            #probs = F.nll_loss(F.log_softmax(probs), probs.max(1)[1])#-( * F.softmax(probs)).sum(1).mean()
+        else:
+            probs = None
+        # x_comms1 = F.relu(0.5*x_comms + 0.5*torch.mm(assignments_t, x))
+        x1 = F.relu(x)
 
-    def _loss(self):
-        # Weight decay loss
-        for var in self.layers[0].vars.values():
-            self.loss += FLAGS.weight_decay * tf.nn.l2_loss(var)
+        # x_comms1 = self.gc1[1](F.dropout(x_comms1, self.dropout, training=self.training))
+        x2 = self.gc2[1](self.gc1[1](F.dropout(x1, self.dropout, training=self.training)), adj)
 
-        # Cross entropy error
-        self.loss += masked_softmax_cross_entropy(self.outputs, self.placeholders['labels'],
-                                                  self.placeholders['labels_mask'])
+        # x_comms2 = 0.5*x_comms1 + 0.5*torch.mm(assignments_t, x1)
+        # for inx, (l1, l2) in enumerate(zip(self.gc1[1:], self.gc2[1:])):
+        #     x = F.relu(x)
+        #     x = F.dropout(x, self.dropout, training=self.training)
+        #     x = l1(x)
+        #     # distance = torch.norm(x[:-n_communities].unsqueeze(1) - x[-n_communities:].unsqueeze(0), 2, 2)
+        #     # _, assignments = torch.min(distance, dim=1)
+        #     x = l2(x, adj)#normalize_adj(adj_nonormed, assignments.cpu().data.numpy(), n_communities).cuda())
 
-    def _accuracy(self):
-        self.accuracy = masked_accuracy(self.outputs, self.placeholders['labels'],
-                                        self.placeholders['labels_mask'])
-
-    def _build(self):
-        self.layers.append(Dense(input_dim=self.input_dim,
-                                 output_dim=FLAGS.hidden1,
-                                 placeholders=self.placeholders,
-                                 act=tf.nn.relu,
-                                 dropout=True,
-                                 sparse_inputs=True,
-                                 logging=self.logging))
-
-        self.layers.append(Dense(input_dim=FLAGS.hidden1,
-                                 output_dim=self.output_dim,
-                                 placeholders=self.placeholders,
-                                 act=lambda x: x,
-                                 dropout=True,
-                                 logging=self.logging))
-
-    def predict(self):
-        return tf.nn.softmax(self.outputs)
+        # similarity = F.cosine_similarity(exp_posteriors.unsqueeze(1), exp_posteriors.unsqueeze(0), dim=2)
+        # similarity[(similarity<0.9).detach()] = 0
+        # similarity = similarity / similarity.sum(1, keepdim=True)
 
 
-class GCN(Model):
-    def __init__(self, placeholders, input_dim, **kwargs):
-        super(GCN, self).__init__(**kwargs)
+        # gmm = GaussianMixture(n_components=n_communities, covariance_type='diag').fit(x.cpu().data.numpy())
+        # weights = Variable(torch.FloatTensor(gmm.weights_),requires_grad=False)
+        # means = Variable(torch.FloatTensor(gmm.means_),requires_grad=False)
+        # precisions = Variable(torch.FloatTensor(gmm.precisions_),requires_grad=False)
+        # if self.use_cuda:
+        #     weights = weights.cuda()
+        #     means = means.cuda()
+        #     precisions = precisions.cuda()
+        #
+        # posteriors = -0.5 * torch.sum((x.unsqueeze(1) - means.unsqueeze(0))**2 * precisions.unsqueeze(0), 2) + torch.log(weights) + 0.5*torch.log(precisions).sum(1)
+        # exp_posteriors = F.softmax(posteriors, dim=1)
+        # x = x + torch.mm(exp_posteriors, means)*1.0
 
-        self.inputs = placeholders['features']
-        self.input_dim = input_dim
-        # self.input_dim = self.inputs.get_shape().as_list()[1]  # To be supported in future Tensorflow versions
-        self.output_dim = placeholders['labels'].get_shape().as_list()[1]
-        self.placeholders = placeholders
-
-        self.optimizer = tf.train.AdamOptimizer(learning_rate=FLAGS.learning_rate)
-
-        self.build()
-
-    def _loss(self):
-        # Weight decay loss
-        for var in self.layers[0].vars.values():
-            self.loss += FLAGS.weight_decay * tf.nn.l2_loss(var)
-
-        # Cross entropy error
-        self.loss += masked_softmax_cross_entropy(self.outputs, self.placeholders['labels'],
-                                                  self.placeholders['labels_mask'])
-
-    def _accuracy(self):
-        self.accuracy = masked_accuracy(self.outputs, self.placeholders['labels'],
-                                        self.placeholders['labels_mask'])
-
-    def _build(self):
-
-        self.layers.append(GraphConvolution(input_dim=self.input_dim,
-                                            output_dim=FLAGS.hidden1,
-                                            placeholders=self.placeholders,
-                                            act=tf.nn.relu,
-                                            dropout=True,
-                                            sparse_inputs=True,
-                                            logging=self.logging))
-
-        self.layers.append(GraphConvolution(input_dim=FLAGS.hidden1,
-                                            output_dim=self.output_dim,
-                                            placeholders=self.placeholders,
-                                            act=lambda x: x,
-                                            dropout=True,
-                                            logging=self.logging))
-
-    def predict(self):
-        return tf.nn.softmax(self.outputs)
+        return F.log_softmax(x2, dim=1), probs

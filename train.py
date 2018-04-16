@@ -2,106 +2,132 @@ from __future__ import division
 from __future__ import print_function
 
 import time
-import tensorflow as tf
+import argparse
+import numpy as np
 
-from utils import *
-from models import GCN, MLP
+import torch
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.autograd import Variable
+from torch.nn.parameter import Parameter
 
-# Set random seed
-seed = 123
-np.random.seed(seed)
-tf.set_random_seed(seed)
+from utils import load_data, accuracy
+from models import GCN
+from sklearn.mixture import GaussianMixture
 
-# Settings
-flags = tf.app.flags
-FLAGS = flags.FLAGS
-flags.DEFINE_string('dataset', 'cora', 'Dataset string.')  # 'cora', 'citeseer', 'pubmed'
-flags.DEFINE_string('model', 'gcn', 'Model string.')  # 'gcn', 'gcn_cheby', 'dense'
-flags.DEFINE_float('learning_rate', 0.01, 'Initial learning rate.')
-flags.DEFINE_integer('epochs', 200, 'Number of epochs to train.')
-flags.DEFINE_integer('hidden1', 16, 'Number of units in hidden layer 1.')
-flags.DEFINE_float('dropout', 0.5, 'Dropout rate (1 - keep probability).')
-flags.DEFINE_float('weight_decay', 5e-4, 'Weight for L2 loss on embedding matrix.')
-flags.DEFINE_integer('early_stopping', 10, 'Tolerance for early stopping (# of epochs).')
-flags.DEFINE_integer('max_degree', 3, 'Maximum Chebyshev polynomial degree.')
+# Training settings
+parser = argparse.ArgumentParser()
+parser.add_argument('--no-cuda', action='store_true', default=False,
+                    help='Disables CUDA training.')
+parser.add_argument('--fastmode', action='store_true', default=True,
+                    help='Validate during training pass.')
+parser.add_argument('--seed', type=int, default=42, help='Random seed.')
+parser.add_argument('--m_steps', type=int, default=5, help='M steps.')
+parser.add_argument('--epochs', type=int, default=200,
+                    help='Number of epochs to train.')
+parser.add_argument('--n_communities', type=int, default=20,
+                    help='Number of assumed n_communities.')
+parser.add_argument('--lr', type=float, default=0.01,
+                    help='Initial learning rate.')
+parser.add_argument('--weight_decay', type=float, default=5e-4,
+                    help='Weight decay (L2 loss on parameters).')
+parser.add_argument('--hidden', type=int, default=16,
+                    help='Number of hidden units.')
+parser.add_argument('--dropout', type=float, default=0.5,
+                    help='Dropout rate (1 - keep probability).')
+parser.add_argument('--dataset', type=str, default='cora',
+                    help='Dataset to use.')
+
+args = parser.parse_args()
+args.cuda = not args.no_cuda and torch.cuda.is_available()
+
+np.random.seed(args.seed)
+torch.manual_seed(args.seed)
+if args.cuda:
+    torch.cuda.manual_seed(args.seed)
 
 # Load data
-adj, features, y_train, y_val, y_test, train_mask, val_mask, test_mask = load_data(FLAGS.dataset)
+#adj, features, y_train, y_val, y_test, train_mask, val_mask, test_mask = load_data(args.dataset)
+adj, tensor_a, features, labels, idx_train, idx_val, idx_test = load_data(args.dataset, n_components=args.n_communities)
+var_assignments = Variable(tensor_a.cuda(), requires_grad=True)
+# Model and optimizer
+model = GCN(dims=[features.shape[1],args.hidden,labels.max() + 1], dropout=args.dropout, use_cuda=args.cuda)
+ml = list()
+ml.append({'params': model.gc1[0].parameters(), 'weight_decay': args.weight_decay})
+ml.append({'params': model.gc1[-1].parameters()})
+ml.append({'params': var_assignments})
+optimizer = optim.Adam(ml, lr=args.lr)
 
-# Some preprocessing
-features = preprocess_features(features)
-if FLAGS.model == 'gcn':
-    support = [preprocess_adj(adj)]
-    num_supports = 1
-    model_func = GCN
-elif FLAGS.model == 'gcn_cheby':
-    support = chebyshev_polynomials(adj, FLAGS.max_degree)
-    num_supports = 1 + FLAGS.max_degree
-    model_func = GCN
-elif FLAGS.model == 'dense':
-    support = [preprocess_adj(adj)]  # Not used
-    num_supports = 1
-    model_func = MLP
-else:
-    raise ValueError('Invalid argument for model: ' + str(FLAGS.model))
+if args.cuda:
+    model.cuda()
+    features = features.cuda()
+    adj = adj.cuda()
+    labels = labels.cuda()
+    idx_train = idx_train.cuda()
+    idx_val = idx_val.cuda()
+    idx_test = idx_test.cuda()
 
-# Define placeholders
-placeholders = {
-    'support': [tf.sparse_placeholder(tf.float32) for _ in range(num_supports)],
-    'features': tf.sparse_placeholder(tf.float32, shape=tf.constant(features[2], dtype=tf.int64)),
-    'labels': tf.placeholder(tf.float32, shape=(None, y_train.shape[1])),
-    'labels_mask': tf.placeholder(tf.int32),
-    'dropout': tf.placeholder_with_default(0., shape=()),
-    'num_features_nonzero': tf.placeholder(tf.int32)  # helper variable for sparse dropout
-}
+features, labels = Variable(features), Variable(labels)
+PI = None
+MUs = None
+PREs = None
 
-# Create model
-model = model_func(placeholders, input_dim=features[2][1], logging=True)
+def train():
+    global PI, MUs, PREs
+    for epoch in range(args.epochs):
+        for ite in range(args.m_steps):
+            t = time.time()
+            model.train()
+            optimizer.zero_grad()
+            output, probs = model(features, adj, PI, MUs, PREs)
+            if not probs is None:
+                loss_train = F.nll_loss(output[idx_train], labels[idx_train]) + probs*0.01
+            else:
+                loss_train = F.nll_loss(output[idx_train], labels[idx_train])
+            #gg = torch.autograd.grad(loss_train, var_assignments, only_inputs=True, retain_graph=True)
+            #print(var_assignments.grad)
 
-# Initialize session
-sess = tf.Session()
+            acc_train = accuracy(output[idx_train], labels[idx_train])
+            loss_train.backward()
+            optimizer.step()
 
+            if not args.fastmode:
+                # Evaluate validation set performance separately,
+                # deactivates dropout during validation run.
+                model.eval()
+                output, _ = model(features, adj, PI, MUs, PREs)
 
-# Define model evaluation function
-def evaluate(features, support, labels, mask, placeholders):
-    t_test = time.time()
-    feed_dict_val = construct_feed_dict(features, support, labels, mask, placeholders)
-    outs_val = sess.run([model.loss, model.accuracy], feed_dict=feed_dict_val)
-    return outs_val[0], outs_val[1], (time.time() - t_test)
+            loss_val = F.nll_loss(output[idx_val], labels[idx_val])
+            acc_val = accuracy(output[idx_val], labels[idx_val])
+            print('Epoch: {:04d}'.format(epoch*args.m_steps+ite+1),
+                  'loss_train: {:.4f}'.format(loss_train.data[0]),
+                  'acc_train: {:.4f}'.format(acc_train.data[0]),
+                  'loss_val: {:.4f}'.format(loss_val.data[0]),
+                  'acc_val: {:.4f}'.format(acc_val.data[0]),
+                  'time: {:.4f}s'.format(time.time() - t))
+        model.eval()
+        embeddings = model.get_embedding(features, adj).cpu().data.numpy()
+        gmm = GaussianMixture(args.n_communities, 'diag').fit(embeddings)
+        PI = Variable(torch.Tensor(gmm.weights_).cuda())
+        PREs = Variable(torch.Tensor(gmm.precisions_).cuda())
+        MUs = Variable(torch.Tensor(gmm.means_).cuda())
 
+def test():
+    global PI, MUs, PREs
+    model.eval()
+    output, _ = model(features, adj, PI, MUs, PREs)
+    loss_test = F.nll_loss(output[idx_test], labels[idx_test])
+    acc_test = accuracy(output[idx_test], labels[idx_test])
+    print("Test set results:",
+          "loss= {:.4f}".format(loss_test.data[0]),
+          "accuracy= {:.4f}".format(acc_test.data[0]))
 
-# Init variables
-sess.run(tf.global_variables_initializer())
-
-cost_val = []
 
 # Train model
-for epoch in range(FLAGS.epochs):
-
-    t = time.time()
-    # Construct feed dictionary
-    feed_dict = construct_feed_dict(features, support, y_train, train_mask, placeholders)
-    feed_dict.update({placeholders['dropout']: FLAGS.dropout})
-
-    # Training step
-    outs = sess.run([model.opt_op, model.loss, model.accuracy], feed_dict=feed_dict)
-
-    # Validation
-    cost, acc, duration = evaluate(features, support, y_val, val_mask, placeholders)
-    cost_val.append(cost)
-
-    # Print results
-    print("Epoch:", '%04d' % (epoch + 1), "train_loss=", "{:.5f}".format(outs[1]),
-          "train_acc=", "{:.5f}".format(outs[2]), "val_loss=", "{:.5f}".format(cost),
-          "val_acc=", "{:.5f}".format(acc), "time=", "{:.5f}".format(time.time() - t))
-
-    if epoch > FLAGS.early_stopping and cost_val[-1] > np.mean(cost_val[-(FLAGS.early_stopping+1):-1]):
-        print("Early stopping...")
-        break
-
+t_total = time.time()
+train()
 print("Optimization Finished!")
+print("Total time elapsed: {:.4f}s".format(time.time() - t_total))
 
 # Testing
-test_cost, test_acc, test_duration = evaluate(features, support, y_test, test_mask, placeholders)
-print("Test set results:", "cost=", "{:.5f}".format(test_cost),
-      "accuracy=", "{:.5f}".format(test_acc), "time=", "{:.5f}".format(test_duration))
+test()
