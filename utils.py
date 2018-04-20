@@ -4,10 +4,17 @@ import torch
 import sys
 import networkx as nx
 import pickle as pkl
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.autograd.variable import Variable
+#from sklearn.mixture import GaussianMixture
+from sklearn.cluster import KMeans
 
-
-def encode_onehot(labels):
-    classes = set(labels)
+def encode_onehot(labels, classes=None):
+    if classes is None:
+        classes = set(labels)
+    else:
+        classes = range(classes)
     classes_dict = {c: np.identity(len(classes))[i, :] for i, c in
                     enumerate(classes)}
     labels_onehot = np.array(list(map(classes_dict.get, labels)),
@@ -21,29 +28,30 @@ def parse_index_file(filename):
         index.append(int(line.strip()))
     return index
 
-def normalize_adj(adj_nonormed):
+def normalize_adj(adj_nonormed, use_torch=0):
     """Symmetrically normalize adjacency matrix."""
-    adj = sp.coo_matrix(adj_nonormed)
-    # adj_n = np.zeros([n_components, adj.shape[0]])
-    # for i in range(n_components):
-    #     adj_n[i] = (assignments==i).astype(np.float32)
-    # p1 = sp.vstack([adj, sp.coo_matrix(adj_n)])
-    # p2 = sp.vstack([sp.coo_matrix(adj_n.transpose()), sp.coo_matrix(np.zeros([n_components, n_components]))])
-    # adj = sp.hstack([p1, p2])
-    # cnt = 0
-    # for i in range(1,1+n_components):
-    #     tmp = adj.toarray()[-i].sum()
-    #     print(tmp)
-    #     cnt = cnt + tmp
-    # print(cnt)
-    adj = adj + sp.eye(adj.shape[0])
-    rowsum = np.array(adj.sum(1))
-    d_inv_sqrt = np.power(rowsum, -0.5).flatten()
-    d_inv_sqrt[np.isinf(d_inv_sqrt)] = 0.
-    d_mat_inv_sqrt = sp.diags(d_inv_sqrt)
-    return sparse_mx_to_torch_sparse_tensor(adj.dot(d_mat_inv_sqrt).transpose().dot(d_mat_inv_sqrt).tocoo())
+    if not use_torch:
+        adj = sp.coo_matrix(adj_nonormed)
+        # adj_n = np.zeros([n_components, adj.shape[0]])
+        # for i in range(n_components):
+        #     adj_n[i] = (assignments==i).astype(np.float32)
+        #assignments = encode_onehot(assignments, n_communities)
+        # p1 = sp.hstack([adj + sp.eye(adj.shape[0]), sp.coo_matrix(assignments)])
+        # p2 = sp.hstack([sp.coo_matrix(assignments.transpose()), sp.coo_matrix(np.zeros([assignments.shape[1], assignments.shape[1]]))])
+        # adj = sp.vstack([p1, p2])
+        # cnt = 0
+        # for i in range(1,1+n_components):
+        #     tmp = adj.toarray()[-i].sum()
+        #     print(tmp)
+        #     cnt = cnt + tmp
+        # print(cnt)
+        rowsum = np.array(adj.sum(1))
+        d_inv_sqrt = np.power(rowsum, -0.5).flatten()
+        d_inv_sqrt[np.isinf(d_inv_sqrt)] = 0.
+        d_mat_inv_sqrt = sp.diags(d_inv_sqrt)
+        return sparse_mx_to_torch_sparse_tensor(adj.dot(d_mat_inv_sqrt).transpose().dot(d_mat_inv_sqrt).tocoo())
 
-def load_data(dataset_str="cora", n_components=10):
+def load_data(dataset_str="cora", n_communities=20):
     """Load data."""
     names = ['x', 'y', 'tx', 'ty', 'allx', 'ally', 'graph']
     objects = []
@@ -73,16 +81,19 @@ def load_data(dataset_str="cora", n_components=10):
     features[test_idx_reorder, :] = features[test_idx_range, :]
 
     features = normalize(features).toarray()
-    # gmm = GaussianMixture(n_components=n_components).fit(features)
-    assignments = torch.FloatTensor(np.random.randn(features.shape[0], n_components))
-    # assignments = gmm.predict(features)
-    # features = np.concatenate([features, normalize(gmm.means_)], 0)
+    kmn = KMeans(n_communities, n_jobs=-1).fit(features)
+    means = kmn.cluster_centers_
+    #assignments = gmm.predict_proba(features)
+    features = np.concatenate((features, normalize(means)))
+
+
     adj_nonormed = nx.adjacency_matrix(nx.from_dict_of_lists(graph))
-    adj = normalize_adj(adj_nonormed)
+    #adj = normalize_adj(adj_nonormed, assignments, n_communities)
     labels = np.vstack((ally, ty))
     labels[test_idx_reorder, :] = labels[test_idx_range, :]
 
-    idx_test = test_idx_range.tolist()
+
+    idx_test = test_idx_range.tolist()[:-15]
     idx_train = range(len(y))
     idx_val = range(len(y), len(y)+500)
 
@@ -92,50 +103,8 @@ def load_data(dataset_str="cora", n_components=10):
     idx_train = torch.LongTensor(idx_train)
     idx_val = torch.LongTensor(idx_val)
     idx_test = torch.LongTensor(idx_test)
-
-    return adj, assignments, features, labels, idx_train, idx_val, idx_test
-
-
-    # """Load citation network dataset (cora only for now)"""
-    # path = 'data/'
-    # dataset = dataset_str
-    # idx_features_labels = np.genfromtxt("{}{}.content".format(path, dataset),
-    #                                     dtype=np.dtype(str))
-    # features = sp.csr_matrix(idx_features_labels[:, 1:-1], dtype=np.float32)
-    # labels = encode_onehot(idx_features_labels[:, -1])
-    #
-    # # build graph
-    # idx = np.array(idx_features_labels[:, 0], dtype=np.int32)
-    # idx_map = {j: i for i, j in enumerate(idx)}
-    # edges_unordered = np.genfromtxt("{}{}.cites".format(path, dataset),
-    #                                 dtype=np.int32)
-    # edges = np.array(list(map(idx_map.get, edges_unordered.flatten())),
-    #                  dtype=np.int32).reshape(edges_unordered.shape)
-    # adj = sp.coo_matrix((np.ones(edges.shape[0]), (edges[:, 0], edges[:, 1])),
-    #                     shape=(labels.shape[0], labels.shape[0]),
-    #                     dtype=np.float32)
-    #
-    # # build symmetric adjacency matrix
-    # #print(adj.toarray()[:10,:10])
-    # adj = normalize_adj(adj + adj.T + sp.eye(adj.shape[0]))
-    # #adj = adj + adj.T.multiply(adj.T > adj) - adj.multiply(adj.T > adj)
-    #
-    # features = normalize(features)
-    # adj = normalize(adj + sp.eye(adj.shape[0]))
-    #
-    # idx_train = range(140)
-    # idx_val = range(200, 500)
-    # idx_test = range(500, 1500)
-    #
-    # features = torch.FloatTensor(np.array(features.todense()))
-    # labels = torch.LongTensor(np.where(labels)[1])
-    # adj = sparse_mx_to_torch_sparse_tensor(adj)
-    #
-    # idx_train = torch.LongTensor(idx_train)
-    # idx_val = torch.LongTensor(idx_val)
-    # idx_test = torch.LongTensor(idx_test)
-    #
-    # return adj, None, features, labels, idx_train, idx_val, idx_test
+    #adj_nonormed = torch.FloatTensor(sp.coo_matrix().toarray())
+    return normalize_adj(adj_nonormed+ sp.eye(labels.shape[0])), features, labels, idx_train, idx_val, idx_test
 
 
 def normalize(mx):
@@ -151,8 +120,8 @@ def normalize(mx):
 def accuracy(output, labels):
     preds = output.max(1)[1].type_as(labels)
     correct = preds.eq(labels).double()
-    correct = correct.sum()
-    return correct / len(labels)
+    #print(correct.cpu().data.numpy().mean)
+    return correct.mean()
 
 
 def sparse_mx_to_torch_sparse_tensor(sparse_mx):
@@ -175,3 +144,68 @@ def log_sum_exp(value, dim=1, keepdim=False):
         m = m.squeeze(dim)
     return m + torch.log(torch.sum(torch.exp(value0),
                                    dim=dim, keepdim=keepdim))
+
+def sample_nodes(adj_nonormed, num=100):
+    N = adj_nonormed.shape[0]
+    flag = np.zeros([N])
+    output = [0] * num
+    for i in range(num):
+        a = np.random.randint(0, N)
+        while flag[a] == 1:
+            a = np.random.randint(0, N)
+        output[i] = a
+        flag[a] = 1
+        flag[np.nonzero(adj_nonormed[a])] = 1
+        for j in np.nonzero(adj_nonormed[a])[0]:
+            flag[np.nonzero(adj_nonormed[j])] = 1
+        #print(flag.sum())
+    output_ = np.ones([N])
+    output_[output] = 0
+    output_ = np.nonzero(output_)[0]
+    return torch.LongTensor(output).cuda(), torch.LongTensor(output_).cuda()
+
+def vat_loss(model, X, adj, adj_nonormed, xi=1e-6, eps=1.0, Ip=1, use_gpu=True):
+    """VAT loss function
+    :param model: networks to train
+    :param X: Variable, input
+    :param xi: hyperparameter of VAT (default: 1e-6)
+    :param eps: hyperparameter of VAT (default: 1.0)
+    :param Ip: iteration times of computing adv noise (default: 1)
+    :param use_gpu: use gpu or not (default: True)
+    :return: LDS, model prediction (for classification-loss calculation)
+    """
+    kl_div = nn.KLDivLoss(reduce=False)
+    if use_gpu:
+        kl_div.cuda()
+
+
+    pred = model(X, adj)
+    index_adv, index_ori = sample_nodes(adj_nonormed, 300)
+
+    # prepare random unit tensor
+    d = torch.rand(X.shape)
+    d = Variable(F.normalize(d, p=2, dim=1).cuda(), requires_grad = True)
+    # calc adversarial direction
+    for ip in range(Ip):
+        d= Variable(d.data * xi, requires_grad = True)
+        pred_hat = model((X + d), adj)
+        adv_distance = kl_div(F.log_softmax(pred_hat, dim=1), F.softmax(pred.detach())).sum(1)[index_adv].mean()
+        adv_distance.backward()
+        d = Variable(F.normalize(d.grad.data, p=2, dim=1).cuda(), requires_grad = True)
+        model.zero_grad()
+
+    # calc LDS
+    # model.train()
+    # pred = model(X, adj)
+
+    r_adv = d * eps
+    # r_adv[index_ori] = 0
+    X_hat = X + r_adv
+    #X_hat = X_hat / X_hat.sum(1, keepdim=True)
+    pred_hat = model(X_hat, adj)
+    print(accuracy(pred_hat[index_adv], pred[index_adv].max(1)[1]))
+    # model.train()
+    # pred = model(X, adj)
+    LDS = kl_div(F.log_softmax(pred_hat, dim=1), F.softmax(pred.detach())).sum(1)[index_adv].mean()
+
+    return LDS - torch.sum(F.log_softmax(pred, dim=1)*F.softmax(pred, dim=1), 1).mean()
